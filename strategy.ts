@@ -64,6 +64,10 @@ export interface Params {
   dipMinRecentBuyers: number;
   /** Pyramid adds: buys after the first one, each on a later batch, while the coin keeps rising. */
   maxAdds: number;
+  /** Re-entry: how many separate entries one coin may get (1 = one entry ever). */
+  maxEntries: number;
+  /** Slots that must pass after an exit before the same coin may re-enter. */
+  reentryCooldownSlots: number;
   /** An add needs the price at least this far (bps) above the previous buy's decision price. */
   addStepBps: number;
   /** An add waits this many slots after the previous buy was decided. */
@@ -118,13 +122,15 @@ export const DEFAULT_PARAMS: Params = {
   dipMinFlowLamports: 100_000_000,
   dipMinRecentBuyers: 3,
   maxAdds: 2,
+  maxEntries: 1,
+  reentryCooldownSlots: 150,
   addStepBps: 1000,
   addDelay: 2,
   addLamports: 150_000_000,
   addMinFlowLamports: 0,
   tpBps: 4000,
   slBps: 2000,
-  trailArmBps: 1500,
+  trailArmBps: 3000,
   trailBps: 800,
   maxHold: 200,
   exitOnDevSell: true,
@@ -164,6 +170,9 @@ interface Coin {
   prevBps: bigint | null;
   /** Entry already taken (strength or dip); after an exit the coin is done for good. */
   entered: boolean;
+  /** Completed entries (exits) so far, and the slot of the latest exit. */
+  entries: number;
+  lastExitSlot: number;
   done: boolean;
   complete: boolean;
   /** Pyramid state: decision price (bps vs create) of the last buy, its slot, adds used. */
@@ -228,6 +237,8 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
           peakSlot: e.slot,
           prevBps: null,
           entered: false,
+          entries: 0,
+          lastExitSlot: 0,
           done: false,
           complete: false,
           lastBuyBps: 0n,
@@ -354,10 +365,18 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         if (!exit) continue;
         orders.push({ side: 'sell', mint, token_amount: pos.token_amount, max_slippage_bps: 10_000 });
         selling.add(mint);
-        if (c !== undefined) c.done = true;
+        if (c !== undefined) {
+          c.entries += 1;
+          c.lastExitSlot = state.slot;
+          c.entered = false;
+          c.addsUsed = 0;
+          c.lastBuyBps = 0n;
+          c.aboveSince = null;
+          if (c.entries >= P.maxEntries) c.done = true;
+        }
       }
 
-      // Entries: strength first, dip-sprint second. One entry per coin, ever.
+      // Entries: strength first, dip-sprint second. Up to maxEntries entries per coin.
       let free = state.freeCashLamports() - tx * BigInt(orders.length);
       let open = state.committedPositionCount();
       for (const c of coins.values()) {
@@ -422,6 +441,10 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
           c.done = true;
           continue;
         }
+        // Re-entry safety: never buy a coin we still hold, are selling, or have
+        // a buy in flight for; respect the cooldown after an exit.
+        if (state.positions.has(c.mint) || selling.has(c.mint) || hasPendingBuy(state, c.mint)) continue;
+        if (c.entries > 0 && state.slot - c.lastExitSlot < P.reentryCooldownSlots) continue;
 
         let want = false;
         // (1) Wait-for-strength: price held above the confirm level long enough,
