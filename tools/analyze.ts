@@ -138,3 +138,38 @@ for (const [mint, c] of coins) {
   if (tot <= 12) console.log(`${mint.slice(0, 8)} complete-create=${c.completeSlot - c.createSlot} gap20=${g20} gap50=${g50} gap100=${g100}`);
 }
 console.log(`graduates=${tot} catchable(>=2 slots after cross): +20% ${catch20}, +50% ${catch50}, +100% ${catch100}`);
+
+// Survivors: coins still trading at age A with price above create — forward return after that.
+for (const A of [300, 1000, 3000]) {
+  const surv = all.filter((c) => c.lastSlot - c.createSlot >= A);
+  console.log(`alive at age ${A}: ${surv.length} coins`);
+}
+console.log('--- forward return from first trade at age>=1000 ---');
+const fw: number[] = [];
+let nPos = 0, nGrad = 0;
+for (const c of all) {
+  if (c.lastSlot - c.createSlot < 1000) continue;
+  // price at age 1000 approximated by last/peak is not available; use peak-after-1000 proxy: skip
+  void c;
+}
+// Direct pass: price at first trade with slot>=create+1000 vs last price.
+const priceAt: Record<string, number> = {};
+for (const e of events) {
+  if (e.event !== 'TradeEvent') continue;
+  const c = coins.get(e.mint);
+  if (!c) continue;
+  if (priceAt[e.mint] === undefined && e.slot - c.createSlot >= 1000) {
+    priceAt[e.mint] = Number((BigInt(e.virtual_quote_reserves) * c.vt0 * 10000n) / (BigInt(e.virtual_token_reserves) * c.vq0));
+  }
+}
+const rets: number[] = [];
+let above = 0;
+for (const [mint, p1000] of Object.entries(priceAt)) {
+  const c = coins.get(mint)!;
+  if (p1000 >= 10000) above++;
+  rets.push(c.last / p1000);
+  if (c.complete) nGrad++;
+}
+rets.sort((a, b) => a - b);
+console.log(`coins with a trade at age>=1000: ${rets.length}, price>=create at that point: ${above}, graduates among them: ${nGrad}`);
+console.log(`forward last/price@1000: median ${rets.length ? rets[Math.floor(rets.length / 2)]!.toFixed(2) : '-'} p75 ${rets.length ? rets[Math.floor(rets.length * 0.75)]!.toFixed(2) : '-'} share>1.2x: ${rets.length ? (100 * rets.filter((r) => r >= 1.2).length / rets.length).toFixed(1) : '-'}% share>2x: ${rets.length ? (100 * rets.filter((r) => r >= 2).length / rets.length).toFixed(1) : '-'}%`);

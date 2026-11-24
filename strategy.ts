@@ -29,6 +29,13 @@ export interface Params {
   minBuyers: number;
   /** Trades seen before entry, at least. */
   minTrades: number;
+  /** Largest single non-creator sell seen, as bps of the real SOL reserve before it, at most. */
+  maxBigSellBps: number;
+  /** Flow acceleration: short window (slots) whose net flow must clear accelMinFlowLamports. */
+  flowAccelShort: number;
+  accelMinFlowLamports: number;
+  /** Distinct buyers in the short acceleration window, at least. */
+  minRecentBuyers: number;
   /** Real SOL reserve window at decision time (lamports). */
   minRealSol: number;
   maxRealSol: number;
@@ -53,6 +60,8 @@ export interface Params {
   /** Dip-sprint: short-window net flow that must be positive to buy the dip. */
   dipFlowWindow: number;
   dipMinFlowLamports: number;
+  /** Dip-sprint: distinct buyers in the dip flow window, at least. */
+  dipMinRecentBuyers: number;
   /** Pyramid adds: buys after the first one, each on a later batch, while the coin keeps rising. */
   maxAdds: number;
   /** An add needs the price at least this far (bps) above the previous buy's decision price. */
@@ -84,38 +93,43 @@ export const DEFAULT_PARAMS: Params = {
   strengthMinAge: 6,
   strengthMaxAge: 900,
   confirmRunupBps: 5000,
-  confirmHoldSlots: 30,
+  confirmHoldSlots: 20,
   strengthMaxRunupBps: 8000,
   flowWindow: 30,
-  minFlowLamports: 100_000_000,
+  minFlowLamports: 50_000_000,
   minBuyers: 4,
   minTrades: 5,
+  maxBigSellBps: 10_000,
+  flowAccelShort: 10,
+  accelMinFlowLamports: 50_000_000,
+  minRecentBuyers: 3,
   minRealSol: 300_000_000,
   maxRealSol: 50_000_000_000,
   skipDevSold: true,
   stakeLamports: 150_000_000,
   minBuyLamports: 20_000_000,
   buySlippageBps: 10_000,
-  dipMinPeakRunupBps: 2500,
+  dipMinPeakRunupBps: 100_000,
   dipPullbackBps: 8000,
-  dipFloorBps: 500,
+  dipFloorBps: 20_000,
   dipPeakAge: 400,
   dipMaxAge: 1500,
   dipFlowWindow: 12,
-  dipMinFlowLamports: 20_000_000,
-  maxAdds: 0,
+  dipMinFlowLamports: 100_000_000,
+  dipMinRecentBuyers: 3,
+  maxAdds: 2,
   addStepBps: 1000,
   addDelay: 2,
   addLamports: 150_000_000,
   addMinFlowLamports: 0,
-  tpBps: 2000,
-  slBps: 1200,
+  tpBps: 4000,
+  slBps: 2000,
   trailArmBps: 1500,
   trailBps: 800,
-  maxHold: 600,
+  maxHold: 200,
   exitOnDevSell: true,
   staleSlots: 1_000_000,
-  exitFlowLamports: 500_000_000,
+  exitFlowLamports: 100_000_000,
 };
 
 interface Tick {
@@ -134,6 +148,10 @@ interface Coin {
   trades: number;
   buyers: Set<Pubkey>;
   devSold: boolean;
+  /** Largest single non-creator sell, as bps of real SOL before it. */
+  bigSellBps: bigint;
+  soldByOthers: bigint;
+  bought: bigint;
   lastTradeSlot: number;
   /** Trades of the last flowWindow slots (older ones dropped as new ones come). */
   recent: Tick[];
@@ -200,6 +218,9 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
           trades: 0,
           buyers: new Set(),
           devSold: false,
+          bigSellBps: 0n,
+          soldByOthers: 0n,
+          bought: 0n,
           lastTradeSlot: e.slot,
           recent: [],
           aboveSince: null,
@@ -222,10 +243,22 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         c.recent.push({ slot: e.slot, isBuy: e.is_buy, sol, user: e.user });
         const isDev = e.user === c.creator;
         if (e.is_buy) {
+          c.bought += sol;
           if (!isDev) c.buyers.add(e.user);
         } else if (isDev) {
           c.devSold = true;
+        } else {
+          c.soldByOthers += sol;
+          const rqBefore = BigInt(e.real_quote_reserves) + sol;
+          if (rqBefore > 0n) {
+            const bps = (sol * BPS) / rqBefore;
+            if (bps > c.bigSellBps) c.bigSellBps = bps;
+          }
         }
+        // Keep only recent ticks (flow windows never exceed 120 slots).
+        let drop = 0;
+        while (drop < c.recent.length && c.recent[drop]!.slot <= batch.slot - 150) drop++;
+        if (drop > 0) c.recent.splice(0, drop);
       } else {
         const c = coins.get(e.mint);
         if (c !== undefined) {
@@ -236,15 +269,13 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
     }
   }
 
-  /** Net lamports bought minus sold and the distinct buyers, over the last `window` slots. */
+  /** Net lamports bought minus sold and the distinct buyers, over the last `window` slots. Pure: readEvents already prunes old ticks. */
   function flow(c: Coin, slot: number, window: number): { net: bigint; buyers: number } {
     const from = slot - window;
-    let drop = 0;
-    while (drop < c.recent.length && c.recent[drop]!.slot <= from) drop++;
-    if (drop > 0) c.recent.splice(0, drop);
     let net = 0n;
     const buyers = new Set<Pubkey>();
     for (const t of c.recent) {
+      if (t.slot <= from) continue;
       if (t.isBuy) {
         net += t.sol;
         if (t.user !== c.creator) buyers.add(t.user);
@@ -397,9 +428,14 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         // with sustained positive flow and enough distinct buyers.
         if (!want && age >= P.strengthMinAge && age <= P.strengthMaxAge) {
           const heldLong = c.aboveSince !== null && state.slot - c.aboveSince >= P.confirmHoldSlots;
-          if (heldLong && bps <= BPS + BigInt(P.strengthMaxRunupBps)) {
+          if (heldLong && bps <= BPS + BigInt(P.strengthMaxRunupBps) && c.bigSellBps <= BigInt(P.maxBigSellBps)) {
             const fl = flow(c, state.slot, P.flowWindow);
-            if (fl.net >= BigInt(P.minFlowLamports) && fl.buyers >= P.minBuyers && c.trades >= P.minTrades) want = true;
+            let accelOk = true;
+            if (P.flowAccelShort > 0) {
+              const short = flow(c, state.slot, P.flowAccelShort);
+              accelOk = short.net >= BigInt(P.accelMinFlowLamports) && short.buyers >= P.minRecentBuyers;
+            }
+            if (accelOk && fl.net >= BigInt(P.minFlowLamports) && fl.buyers >= P.minBuyers && c.trades >= P.minTrades) want = true;
           }
         }
         // (2) Dip-sprint: proved strength, pulled back from its peak, still above
@@ -411,7 +447,7 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
           const recovering = prev !== null && bps >= prev;
           if (pulledBack && aboveFloor && peakFresh && recovering) {
             const fl = flow(c, state.slot, P.dipFlowWindow);
-            if (fl.net >= BigInt(P.dipMinFlowLamports) && c.trades >= P.minTrades) want = true;
+            if (fl.net >= BigInt(P.dipMinFlowLamports) && fl.buyers >= P.dipMinRecentBuyers && c.trades >= P.minTrades) want = true;
           }
         }
         if (!want) continue;
