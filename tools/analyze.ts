@@ -106,3 +106,35 @@ for (const minB of [5, 10, 20]) {
 }
 const s2 = all.filter((c) => c.peak >= 20000 && c.buyers.size >= 10 && !c.devSold);
 console.log(`peak>=+100% & buyers>=10 & !devSold: n=${s2.length} graduates=${s2.filter((c) => c.complete).length}`);
+
+// For each graduate: slots from first crossing +20%/+50%/+100% to completion.
+console.log('--- graduates: cross->complete gaps (slots) ---');
+const cross: Record<string, { c20: number; c50: number; c100: number }> = {};
+for (const e of events) {
+  if (e.event === 'CreateEvent') {
+    cross[e.mint] = { c20: -1, c50: -1, c100: -1 };
+  } else if (e.event === 'TradeEvent') {
+    const c = coins.get(e.mint);
+    const x = cross[e.mint];
+    if (!c || !x) continue;
+    const r = Number((BigInt(e.virtual_quote_reserves) * c.vt0 * 10000n) / (BigInt(e.virtual_token_reserves) * c.vq0));
+    if (x.c20 < 0 && r >= 12000) x.c20 = e.slot;
+    if (x.c50 < 0 && r >= 15000) x.c50 = e.slot;
+    if (x.c100 < 0 && r >= 20000) x.c100 = e.slot;
+  }
+}
+let catch20 = 0, catch50 = 0, catch100 = 0, tot = 0;
+for (const [mint, c] of coins) {
+  if (!c.complete) continue;
+  const x = cross[mint];
+  if (!x) continue;
+  tot++;
+  const g20 = x.c20 >= 0 ? c.completeSlot - x.c20 : -1;
+  const g50 = x.c50 >= 0 ? c.completeSlot - x.c50 : -1;
+  const g100 = x.c100 >= 0 ? c.completeSlot - x.c100 : -1;
+  if (g20 >= 2) catch20++;
+  if (g50 >= 2) catch50++;
+  if (g100 >= 2) catch100++;
+  if (tot <= 12) console.log(`${mint.slice(0, 8)} complete-create=${c.completeSlot - c.createSlot} gap20=${g20} gap50=${g50} gap100=${g100}`);
+}
+console.log(`graduates=${tot} catchable(>=2 slots after cross): +20% ${catch20}, +50% ${catch50}, +100% ${catch100}`);

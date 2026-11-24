@@ -53,6 +53,16 @@ export interface Params {
   /** Dip-sprint: short-window net flow that must be positive to buy the dip. */
   dipFlowWindow: number;
   dipMinFlowLamports: number;
+  /** Pyramid adds: buys after the first one, each on a later batch, while the coin keeps rising. */
+  maxAdds: number;
+  /** An add needs the price at least this far (bps) above the previous buy's decision price. */
+  addStepBps: number;
+  /** An add waits this many slots after the previous buy was decided. */
+  addDelay: number;
+  /** Lamports per add (each still capped at 1% of real SOL). */
+  addLamports: number;
+  /** An add needs the recent net flow at least this. */
+  addMinFlowLamports: number;
   /** Exit when the position is worth this much over its cost (bps). */
   tpBps: number;
   /** Exit when it is worth this much under its cost (bps). */
@@ -73,8 +83,8 @@ export interface Params {
 export const DEFAULT_PARAMS: Params = {
   strengthMinAge: 6,
   strengthMaxAge: 900,
-  confirmRunupBps: 1500,
-  confirmHoldSlots: 8,
+  confirmRunupBps: 5000,
+  confirmHoldSlots: 30,
   strengthMaxRunupBps: 8000,
   flowWindow: 30,
   minFlowLamports: 100_000_000,
@@ -87,12 +97,17 @@ export const DEFAULT_PARAMS: Params = {
   minBuyLamports: 20_000_000,
   buySlippageBps: 10_000,
   dipMinPeakRunupBps: 2500,
-  dipPullbackBps: 800,
+  dipPullbackBps: 8000,
   dipFloorBps: 500,
   dipPeakAge: 400,
   dipMaxAge: 1500,
   dipFlowWindow: 12,
   dipMinFlowLamports: 20_000_000,
+  maxAdds: 0,
+  addStepBps: 1000,
+  addDelay: 2,
+  addLamports: 150_000_000,
+  addMinFlowLamports: 0,
   tpBps: 2000,
   slBps: 1200,
   trailArmBps: 1500,
@@ -133,6 +148,10 @@ interface Coin {
   entered: boolean;
   done: boolean;
   complete: boolean;
+  /** Pyramid state: decision price (bps vs create) of the last buy, its slot, adds used. */
+  lastBuyBps: bigint;
+  lastBuySlot: number;
+  addsUsed: number;
 }
 
 interface Held {
@@ -190,6 +209,9 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
           entered: false,
           done: false,
           complete: false,
+          lastBuyBps: 0n,
+          lastBuySlot: 0,
+          addsUsed: 0,
         });
       } else if (e.event === 'TradeEvent') {
         const c = coins.get(e.mint);
@@ -309,19 +331,14 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
       let open = state.committedPositionCount();
       for (const c of coins.values()) {
         if (orders.length >= cap) break;
-        if (c.done || c.complete || c.entered) continue;
+        if (c.done || c.complete) continue;
         const age = state.slot - c.createSlot;
-        if (age > Math.max(P.strengthMaxAge, P.dipMaxAge)) {
+        if (!c.entered && age > Math.max(P.strengthMaxAge, P.dipMaxAge)) {
           c.done = true;
           continue;
         }
-        if (open >= state.hello.caps.max_open_positions) continue;
         const curve = state.curves.get(c.mint);
         if (curve === undefined || curve.complete) continue;
-        if (c.devSold && P.skipDevSold) {
-          c.done = true;
-          continue;
-        }
         const vq = curve.virtual_quote_reserves;
         const vt = curve.virtual_token_reserves;
         const bps = priceBps(vq, vt, c.vq0, c.vt0);
@@ -337,6 +354,43 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         }
         const prev = c.prevBps;
         c.prevBps = bps;
+
+        // Pyramid add: the coin keeps making new highs on positive flow — buy
+        // another 1%-of-reserve tranche (the cap grows with the curve, so a real
+        // runner gets a much bigger total stake than a single first buy allows).
+        if (c.entered) {
+          if (
+            state.positions.has(c.mint) &&
+            !selling.has(c.mint) &&
+            !hasPendingBuy(state, c.mint) &&
+            c.addsUsed < P.maxAdds &&
+            state.slot - c.lastBuySlot >= P.addDelay &&
+            bps >= c.lastBuyBps + BigInt(P.addStepBps) &&
+            !c.devSold
+          ) {
+            const fl = flow(c, state.slot, P.flowWindow);
+            if (fl.net >= BigInt(P.addMinFlowLamports)) {
+              const rq = curve.real_quote_reserves;
+              if (rq >= BigInt(P.minRealSol) && rq <= BigInt(P.maxRealSol)) {
+                const maxBuy = state.maxBuyLamports(c.mint);
+                const addAmt = BigInt(P.addLamports) < maxBuy ? BigInt(P.addLamports) : maxBuy;
+                if (addAmt >= minBuy && free >= addAmt + tx) {
+                  orders.push({ side: 'buy', mint: c.mint, quote_lamports: addAmt, max_slippage_bps: P.buySlippageBps });
+                  free -= addAmt + tx;
+                  c.addsUsed += 1;
+                  c.lastBuyBps = bps;
+                  c.lastBuySlot = state.slot;
+                }
+              }
+            }
+          }
+          continue;
+        }
+        if (open >= state.hello.caps.max_open_positions) continue;
+        if (c.devSold && P.skipDevSold) {
+          c.done = true;
+          continue;
+        }
 
         let want = false;
         // (1) Wait-for-strength: price held above the confirm level long enough,
@@ -370,6 +424,8 @@ export function createStrategy(params: Params = DEFAULT_PARAMS): Strategy {
         orders.push({ side: 'buy', mint: c.mint, quote_lamports: amount, max_slippage_bps: P.buySlippageBps });
         free -= amount + tx;
         c.entered = true;
+        c.lastBuyBps = bps;
+        c.lastBuySlot = state.slot;
         open += 1;
       }
       return orders;
