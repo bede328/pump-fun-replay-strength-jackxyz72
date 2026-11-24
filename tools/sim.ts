@@ -120,8 +120,13 @@ const cache = new Map<string, { manifest: any; events: any[] }>();
 function load(kit: string) {
   let c = cache.get(kit);
   if (c === undefined) {
-    const raw = gunzipSync(readFileSync(`${kit}/dataset/events/part-00000.ndjson.gz`)).toString('utf8');
-    c = { manifest: JSON.parse(readFileSync(`${kit}/dataset/manifest.json`, 'utf8')), events: raw.split('\n').filter((l) => l.length > 0).map((l) => JSON.parse(l)) };
+    const parts = ['part-00000.ndjson.gz', 'part-00001.ndjson.gz', 'part-00002.ndjson.gz'];
+    const events: any[] = [];
+    for (const p of parts) {
+      const raw = gunzipSync(readFileSync(`${kit}/dataset/events/${p}`)).toString('utf8');
+      for (const l of raw.split('\n')) if (l.length > 0) events.push(JSON.parse(l));
+    }
+    c = { manifest: JSON.parse(readFileSync(`${kit}/dataset/manifest.json`, 'utf8')), events };
     cache.set(kit, c);
   }
   return c;
